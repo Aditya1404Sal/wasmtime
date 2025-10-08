@@ -92,6 +92,11 @@ async fn p3_sockets_tcp_sample_application() -> anyhow::Result<()> {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_socket_tcp_smtp() -> anyhow::Result<()> {
+    run(P3_SOCKETS_TCP_SMTP).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_sockets_tcp_sockopts() -> anyhow::Result<()> {
     run(P3_SOCKETS_TCP_SOCKOPTS_COMPONENT).await
 }
