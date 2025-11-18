@@ -103,10 +103,10 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
             }
         }
 
-        (Method::Post, Some("/double-echo")) => {
+        (Method::Post, Some("/gemini-proxy")) => {
             // Pipe the request body to Gemini API and stream the response back to the client.
 
-            match double_echo(request).await {
+            match gemini_proxy(request).await {
                 Ok(response) => {
                     let mut stream = executor::incoming_body(
                         response.consume().expect("response should be consumable"),
@@ -153,12 +153,7 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
     }
 }
 
-async fn double_echo(
-    incoming_request: IncomingRequest,
-) -> Result<IncomingResponse> {
-    // NOTE: Replace `YOUR_API_KEY` with your actual API key or wire it up from env/config.
-    // Putting the key in the URL query ensures the request doesn't rely on non-standard headers
-    // which some WASI hosts might strip.
+async fn gemini_proxy(incoming_request: IncomingRequest) -> Result<IncomingResponse> {
     let base = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent";
     let api_key = "AIzaSyBJA5yjS1dbFPabuItaAHnRq17wwAKsdWM";
     let full_url = format!("{}?alt=sse&key={}", base, api_key);
@@ -167,7 +162,10 @@ async fn double_echo(
     // Build outgoing headers
     let headers = Fields::new();
     headers
-        .append(&"content-type".to_string(), &b"application/json; charset=utf-8".to_vec())
+        .append(
+            &"content-type".to_string(),
+            &b"application/json; charset=utf-8".to_vec(),
+        )
         .map_err(|_| anyhow!("failed to append content-type header"))?;
 
     let outgoing_request = OutgoingRequest::new(headers);
@@ -207,8 +205,11 @@ async fn double_echo(
         .map_err(|()| anyhow!("failed to set authority"))?;
 
     // Read the incoming prompt from the client's request body (fully) FIRST
-    let mut incoming_stream =
-        executor::incoming_body(incoming_request.consume().expect("request should be consumable"));
+    let mut incoming_stream = executor::incoming_body(
+        incoming_request
+            .consume()
+            .expect("request should be consumable"),
+    );
 
     let mut prompt_bytes = Vec::new();
     while let Some(chunk) = incoming_stream.next().await {
@@ -252,7 +253,7 @@ async fn double_echo(
 
     // Send the JSON payload RIGHT NOW (before awaiting response)
     body.send(json_request.into_bytes()).await?;
-    
+
     // Drop body to signal we're done writing (triggers request completion)
     drop(body);
 
@@ -270,10 +271,6 @@ async fn double_echo(
 
 fn server_error(response_out: ResponseOutparam) {
     respond(500, response_out)
-}
-
-fn bad_request(response_out: ResponseOutparam) {
-    respond(400, response_out)
 }
 
 fn method_not_allowed(response_out: ResponseOutparam) {

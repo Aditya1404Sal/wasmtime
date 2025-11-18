@@ -423,17 +423,14 @@ async fn wasi_http_echo() -> Result<()> {
 }
 
 #[test_log::test(tokio::test)]
-async fn wasi_http_double_echo() -> Result<()> {
-
+async fn wasi_http_gemini_proxy() -> Result<()> {
     let prompt = "Explain how AI works";
 
-    let body_stream = stream::iter([
-        Ok::<_, hyper::Error>(Frame::data(Bytes::from(prompt))),
-    ]);
+    let body_stream = stream::iter([Ok::<_, hyper::Error>(Frame::data(Bytes::from(prompt)))]);
 
     let request = hyper::Request::builder()
         .method(http::Method::POST)
-        .uri("http://example.com:8080/double-echo")
+        .uri("http://127.0.0.1:8080/gemini-proxy")
         .header("content-type", "text/plain")
         .body(BoxBody::new(StreamBody::new(body_stream)))?;
 
@@ -447,23 +444,24 @@ async fn wasi_http_double_echo() -> Result<()> {
     .await??;
 
     assert_eq!(StatusCode::OK, response.status());
-    
+
     println!("\nResponse status: {:?}", response.status());
     println!("Response headers: {:?}", response.headers());
     println!("\n=== Streaming Response ===");
-    
+
     // Stream the body and print each chunk as it arrives
-    let (parts, body) = response.into_parts();
+    let (_parts, body) = response.into_parts();
     let mut body_stream = body;
     let start_time = std::time::Instant::now();
-    
+
     while let Some(frame) = body_stream.frame().await {
         match frame {
             Ok(frame) => {
                 if let Some(chunk) = frame.data_ref() {
                     let elapsed = start_time.elapsed();
-                    println!("[{:.7}s] Chunk received ({} bytes)", 
-                        elapsed.as_secs_f64(), 
+                    println!(
+                        "[{:.7}s] Chunk received ({} bytes)",
+                        elapsed.as_secs_f64(),
                         chunk.len()
                     );
                     if let Ok(text) = str::from_utf8(chunk) {
@@ -479,12 +477,14 @@ async fn wasi_http_double_echo() -> Result<()> {
             }
         }
     }
-    
-    println!("\n=== End (Total: {:.7}s) ===\n", start_time.elapsed().as_secs_f64());
+
+    println!(
+        "\n=== End (Total: {:.7}s) ===\n",
+        start_time.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }
-
 
 async fn do_wasi_http_echo(uri: &str, url_header: Option<&str>) -> Result<()> {
     let body = {
