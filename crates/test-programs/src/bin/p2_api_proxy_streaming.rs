@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use futures::{Future, SinkExt, StreamExt, TryStreamExt, future, stream};
+use futures::{SinkExt, StreamExt, TryStreamExt, stream};
 use test_programs::wasi::http::types::{
     Fields, IncomingRequest, IncomingResponse, Method, OutgoingBody, OutgoingRequest,
     OutgoingResponse, ResponseOutparam, Scheme,
@@ -104,57 +104,48 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
         }
 
         (Method::Post, Some("/double-echo")) => {
-            // Pipe the request body to an outgoing request and stream the response back to the client.
+            // Pipe the request body to Gemini API and stream the response back to the client.
 
-            if let Some(url) = headers.iter().find_map(|(k, v)| {
-                (k == "url")
-                    .then_some(v)
-                    .and_then(|v| std::str::from_utf8(v).ok())
-                    .and_then(|v| Url::parse(v).ok())
-            }) {
-                match double_echo(request, &url).await {
-                    Ok((request_copy, response)) => {
-                        let mut stream = executor::incoming_body(
-                            response.consume().expect("response should be consumable"),
-                        );
+            match double_echo(request).await {
+                Ok(response) => {
+                    let mut stream = executor::incoming_body(
+                        response.consume().expect("response should be consumable"),
+                    );
 
-                        let response = OutgoingResponse::new(
-                            Fields::from_list(
-                                &headers
-                                    .into_iter()
-                                    .filter_map(|(k, v)| (k == "content-type").then_some((k, v)))
-                                    .collect::<Vec<_>>(),
-                            )
-                            .unwrap(),
-                        );
+                    let response = OutgoingResponse::new(
+                        Fields::from_list(&[
+                            ("content-type".to_string(), b"text/event-stream".to_vec()),
+                            ("cache-control".to_string(), b"no-cache".to_vec()),
+                        ])
+                        .unwrap(),
+                    );
 
-                        let mut body = executor::outgoing_body(
-                            response.body().expect("response should be writable"),
-                        );
+                    let mut body = executor::outgoing_body(
+                        response.body().expect("response should be writable"),
+                    );
 
-                        ResponseOutparam::set(response_out, Ok(response));
+                    ResponseOutparam::set(response_out, Ok(response));
 
-                        let response_copy = async move {
-                            while let Some(chunk) = stream.next().await {
-                                body.send(chunk?).await?;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(data) => {
+                                if let Err(e) = body.send(data).await {
+                                    eprintln!("Error sending body: {e}");
+                                    break;
+                                }
                             }
-                            Ok::<_, anyhow::Error>(())
-                        };
-
-                        let (request_copy, response_copy) =
-                            future::join(request_copy, response_copy).await;
-                        if let Err(e) = request_copy.and(response_copy) {
-                            eprintln!("error piping to and from {url}: {e}");
+                            Err(e) => {
+                                eprintln!("Error receiving body: {e}");
+                                break;
+                            }
                         }
                     }
-
-                    Err(e) => {
-                        eprintln!("Error sending outgoing request to {url}: {e}");
-                        server_error(response_out);
-                    }
                 }
-            } else {
-                bad_request(response_out);
+
+                Err(e) => {
+                    eprintln!("Error sending outgoing request to Gemini API: {e}");
+                    server_error(response_out);
+                }
             }
         }
 
@@ -164,16 +155,35 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
 
 async fn double_echo(
     incoming_request: IncomingRequest,
-    url: &Url,
-) -> Result<(impl Future<Output = Result<()>> + use<>, IncomingResponse)> {
-    let outgoing_request = OutgoingRequest::new(Fields::new());
+) -> Result<IncomingResponse> {
+    // NOTE: Replace `YOUR_API_KEY` with your actual API key or wire it up from env/config.
+    // Putting the key in the URL query ensures the request doesn't rely on non-standard headers
+    // which some WASI hosts might strip.
+    let base = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent";
+    let api_key = "AIzaSyBJA5yjS1dbFPabuItaAHnRq17wwAKsdWM";
+    let full_url = format!("{}?alt=sse&key={}", base, api_key);
+    let url: Url = Url::parse(&full_url)?;
+
+    // Build outgoing headers
+    let headers = Fields::new();
+    headers
+        .append(&"content-type".to_string(), &b"application/json; charset=utf-8".to_vec())
+        .map_err(|_| anyhow!("failed to append content-type header"))?;
+
+    let outgoing_request = OutgoingRequest::new(headers);
 
     outgoing_request
         .set_method(&Method::Post)
         .map_err(|()| anyhow!("failed to set method"))?;
 
+    // Use the full path + query (CRITICAL for streaming)
+    let path_with_query = match url.query() {
+        Some(q) => format!("{}?{}", url.path(), q),
+        None => url.path().to_string(),
+    };
+
     outgoing_request
-        .set_path_with_query(Some(url.path()))
+        .set_path_with_query(Some(&path_with_query))
         .map_err(|()| anyhow!("failed to set path_with_query"))?;
 
     outgoing_request
@@ -196,28 +206,58 @@ async fn double_echo(
         )))
         .map_err(|()| anyhow!("failed to set authority"))?;
 
+    // Read the incoming prompt from the client's request body (fully) FIRST
+    let mut incoming_stream =
+        executor::incoming_body(incoming_request.consume().expect("request should be consumable"));
+
+    let mut prompt_bytes = Vec::new();
+    while let Some(chunk) = incoming_stream.next().await {
+        prompt_bytes.extend_from_slice(&chunk?);
+    }
+
+    let prompt = std::str::from_utf8(&prompt_bytes)
+        .map_err(|e| anyhow!("Invalid UTF-8 in prompt: {}", e))?
+        .to_string();
+
+    // Safely escape JSON special characters for embedding in a string literal
+    let escaped_prompt = prompt
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+
+    // Build the Gemini JSON request body. Adjust structure if you want different model args.
+    let json_request = format!(
+        r#"{{
+  "contents": [
+    {{
+      "parts": [
+        {{
+          "text": "{}"
+        }}
+      ]
+    }}
+  ]
+}}"#,
+        escaped_prompt
+    );
+
+    // NOW get the outgoing body and send immediately
     let mut body = executor::outgoing_body(
         outgoing_request
             .body()
             .expect("request body should be writable"),
     );
 
-    let response = executor::outgoing_request_send(outgoing_request);
+    // Send the JSON payload RIGHT NOW (before awaiting response)
+    body.send(json_request.into_bytes()).await?;
+    
+    // Drop body to signal we're done writing (triggers request completion)
+    drop(body);
 
-    let mut stream = executor::incoming_body(
-        incoming_request
-            .consume()
-            .expect("request should be consumable"),
-    );
-
-    let copy = async move {
-        while let Some(chunk) = stream.next().await {
-            body.send(chunk?).await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    };
-
-    let response = response.await?;
+    // NOW send the outgoing request and await the response
+    let response = executor::outgoing_request_send(outgoing_request).await?;
 
     let status = response.status();
 
@@ -225,7 +265,7 @@ async fn double_echo(
         bail!("unexpected status: {status}");
     }
 
-    Ok((copy, response))
+    Ok(response)
 }
 
 fn server_error(response_out: ResponseOutparam) {

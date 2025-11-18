@@ -3,7 +3,7 @@ use crate::http_server::Server;
 use anyhow::{Context, Result, anyhow};
 use futures::{FutureExt, channel::oneshot, future, stream};
 use http_body::Frame;
-use http_body_util::{BodyExt, Collected, Empty, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Collected, StreamBody, combinators::BoxBody};
 use hyper::{Method, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, iter, net::Ipv4Addr, str, sync::Arc};
@@ -424,67 +424,67 @@ async fn wasi_http_echo() -> Result<()> {
 
 #[test_log::test(tokio::test)]
 async fn wasi_http_double_echo() -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), 0)).await?;
 
-    let prefix = format!("http://{}", listener.local_addr()?);
+    let prompt = "Explain how AI works";
 
-    let (_tx, rx) = oneshot::channel::<()>();
+    let body_stream = stream::iter([
+        Ok::<_, hyper::Error>(Frame::data(Bytes::from(prompt))),
+    ]);
 
-    let server = async move {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let stream = TokioIo::new(stream);
-            task::spawn(async move {
-                if let Err(e) = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(
-                        stream,
-                        service_fn(
-                            move |request: hyper::Request<hyper::body::Incoming>| async move {
-                                use http_body_util::BodyExt;
+    let request = hyper::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://example.com:8080/double-echo")
+        .header("content-type", "text/plain")
+        .body(BoxBody::new(StreamBody::new(body_stream)))?;
 
-                                if let (&Method::POST, "/echo") =
-                                    (request.method(), request.uri().path())
-                                {
-                                    Ok::<_, anyhow::Error>(hyper::Response::new(
-                                        request.into_body().boxed(),
-                                    ))
-                                } else {
-                                    Ok(hyper::Response::builder()
-                                        .status(StatusCode::METHOD_NOT_ALLOWED)
-                                        .body(BoxBody::new(
-                                            Empty::new().map_err(|_| unreachable!()),
-                                        ))?)
-                                }
-                            },
-                        ),
-                    )
-                    .await
-                {
-                    eprintln!("error serving connection: {e:?}");
+    let response = run_wasi_http(
+        test_programs_artifacts::P2_API_PROXY_STREAMING_COMPONENT,
+        request,
+        None,
+        None,
+        false,
+    )
+    .await??;
+
+    assert_eq!(StatusCode::OK, response.status());
+    
+    println!("\nResponse status: {:?}", response.status());
+    println!("Response headers: {:?}", response.headers());
+    println!("\n=== Streaming Response ===");
+    
+    // Stream the body and print each chunk as it arrives
+    let (parts, body) = response.into_parts();
+    let mut body_stream = body;
+    let start_time = std::time::Instant::now();
+    
+    while let Some(frame) = body_stream.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(chunk) = frame.data_ref() {
+                    let elapsed = start_time.elapsed();
+                    println!("[{:.7}s] Chunk received ({} bytes)", 
+                        elapsed.as_secs_f64(), 
+                        chunk.len()
+                    );
+                    if let Ok(text) = str::from_utf8(chunk) {
+                        print!("{}", text);
+                        use std::io::Write;
+                        std::io::stdout().flush().unwrap();
+                    }
                 }
-            });
-
-            // Help rustc with type inference:
-            if false {
-                return Ok::<_, anyhow::Error>(());
+            }
+            Err(e) => {
+                eprintln!("\nError reading frame: {e}");
+                break;
             }
         }
     }
-    .then(|result| {
-        if let Err(e) = result {
-            eprintln!("error listening for connections: {e:?}");
-        }
-        future::ready(())
-    })
-    .boxed();
+    
+    println!("\n=== End (Total: {:.7}s) ===\n", start_time.elapsed().as_secs_f64());
 
-    task::spawn(async move {
-        drop(future::select(server, rx).await);
-    });
-
-    do_wasi_http_echo("double-echo", Some(&format!("{prefix}/echo"))).await
+    Ok(())
 }
+
 
 async fn do_wasi_http_echo(uri: &str, url_header: Option<&str>) -> Result<()> {
     let body = {
