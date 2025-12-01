@@ -4,7 +4,7 @@ use wasmtime::{
     component::{Component, Linker, ResourceTable},
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::bindings::Command};
-use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
+use wasmtime_wasi_tls::{WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
 
 struct Ctx {
     table: ResourceTable,
@@ -41,9 +41,7 @@ async fn run_test(path: &str) -> Result<()> {
 
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    let mut opts = LinkOptions::default();
-    opts.tls(true);
-    wasmtime_wasi_tls::add_to_linker(&mut linker, &mut opts, |h: &mut Ctx| {
+    wasmtime_wasi_tls::add_to_linker(&mut linker, |h: &mut Ctx| {
         WasiTls::new(&h.wasi_tls_ctx, &mut h.table)
     })?;
 

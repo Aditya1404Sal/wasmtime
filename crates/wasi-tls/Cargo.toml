@@ -22,6 +22,7 @@ tokio = { workspace = true, features = [
 ] }
 wasmtime = { workspace = true, features = ["runtime", "component-model"] }
 wasmtime-wasi = { workspace = true }
+x509-parser = "0.18.0"
 
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }

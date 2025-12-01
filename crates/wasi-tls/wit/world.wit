@@ -2,5 +2,5 @@
 package wasmtime:wasi-tls;
 
 world bindings {
-  include wasi:tls/imports@0.2.0-draft;
+  include wasi:tls/imports@0.2.0;
 }

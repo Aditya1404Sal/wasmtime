@@ -1,33 +1,83 @@
-@unstable(feature = tls)
+package wasi:tls@0.2.0;
+
 interface types {
-    @unstable(feature = tls)
     use wasi:io/streams@0.2.6.{input-stream, output-stream};
-    @unstable(feature = tls)
     use wasi:io/poll@0.2.6.{pollable};
-    @unstable(feature = tls)
-    use wasi:io/error@0.2.6.{error as io-error};
-
-    @unstable(feature = tls)
-    resource client-handshake {
-        @unstable(feature = tls)
-        constructor(server-name: string, input: input-stream, output: output-stream);
-
-        @unstable(feature = tls)
-        finish: static func(this: client-handshake) -> future-client-streams;
+    
+    /// TLS 1.3 only - no protocol version negotiation needed
+    type cipher-suite = u16;  // Only AEAD suites
+    
+    /// Minimal error types
+    enum error-code {
+        handshake-failure,
+        certificate-invalid,
+        certificate-untrusted,
+        certificate-expired,
+        hostname-mismatch,
+        internal-error,
+        would-block,
     }
-
-    @unstable(feature = tls)
-    resource client-connection {
-        @unstable(feature = tls)
-        close-output: func();
+    
+    /// Certificate for validation
+    resource certificate {
+        subject: func() -> string;
+        issuer: func() -> string;
+        verify-hostname: func(hostname: string) -> bool;
     }
-
-    @unstable(feature = tls)
-    resource future-client-streams {
-        @unstable(feature = tls)
-        subscribe: func() -> pollable;
-
-        @unstable(feature = tls)
-        get: func() -> option<result<result<tuple<client-connection, input-stream, output-stream>, io-error>>>;
+    
+    /// Private identity (certificate + key)
+    resource private-identity {
+        certificate: func() -> certificate;
+    }
+    
+    /// Active connection
+    resource connection {
+        cipher-suite: func() -> cipher-suite;
+        peer-certificate: func() -> option<certificate>;
+        close: func() -> result<_, error-code>;
+    }
+    
+    /// Client handshake
+    resource client {
+        new: static func(
+            server-name: string,
+            transport-input: input-stream,
+            transport-output: output-stream,
+        ) -> result<client, error-code>;
+        
+        set-alpn-protocols: func(protocols: list<string>) -> result;
+        set-identity: func(identity: borrow<private-identity>) -> result;
+        
+        finish: func() -> result<client-result, error-code>;
+        subscribe: func() -> pollable;  // Preview 2
+        // finish: async func() -> result<client-result>;  // Preview 3
+    }
+    
+    record client-result {
+        connection: connection,
+        input: input-stream,
+        output: output-stream,
+    }
+    
+    /// Server handshake
+    resource server {
+        new: static func(
+            transport-input: input-stream,
+            transport-output: output-stream,
+        ) -> result<server, error-code>;
+        
+        set-identity: func(identity: borrow<private-identity>) -> result;
+        set-alpn-protocols: func(protocols: list<string>) -> result;
+        set-client-auth-required: func(required: bool) -> result;
+        
+        finish: func() -> result<server-result, error-code>;
+        subscribe: func() -> pollable;  // Preview 2
+        // finish: async func() -> result<server-result>;  // Preview 3
+    }
+    
+    record server-result {
+        connection: connection,
+        input: input-stream,
+        output: output-stream,
     }
 }

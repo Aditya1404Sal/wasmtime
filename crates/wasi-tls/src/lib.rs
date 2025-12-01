@@ -1,76 +1,5 @@
-//! # Wasmtime's [wasi-tls] (Transport Layer Security) Implementation
-//!
-//! This crate provides the Wasmtime host implementation for the [wasi-tls] API.
-//! The [wasi-tls] world allows WebAssembly modules to perform SSL/TLS operations,
-//! such as establishing secure connections to servers. TLS often relies on other wasi networking systems
-//! to provide the stream so it will be common to enable the [wasi:cli] world as well with the networking features enabled.
-//!
-//! # An example of how to configure [wasi-tls] is the following:
-//!
-//! ```rust
-//! use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-//! use wasmtime::{
-//!     component::{Linker, ResourceTable},
-//!     Store, Engine, Result, Config
-//! };
-//! use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
-//!
-//! struct Ctx {
-//!     table: ResourceTable,
-//!     wasi_ctx: WasiCtx,
-//!     wasi_tls_ctx: WasiTlsCtx,
-//! }
-//!
-//! impl WasiView for Ctx {
-//!     fn ctx(&mut self) -> WasiCtxView<'_> {
-//!         WasiCtxView { ctx: &mut self.wasi_ctx, table: &mut self.table }
-//!     }
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     let ctx = Ctx {
-//!         table: ResourceTable::new(),
-//!         wasi_ctx: WasiCtx::builder()
-//!             .inherit_stderr()
-//!             .inherit_network()
-//!             .allow_ip_name_lookup(true)
-//!             .build(),
-//!         wasi_tls_ctx: WasiTlsCtxBuilder::new()
-//!             // Optionally, configure a different TLS provider:
-//!             // .provider(Box::new(wasmtime_wasi_tls_nativetls::NativeTlsProvider::default()))
-//!             .build(),
-//!     };
-//!
-//!     let mut config = Config::new();
-//!     config.async_support(true);
-//!     let engine = Engine::new(&config)?;
-//!
-//!     // Set up wasi-cli
-//!     let mut store = Store::new(&engine, ctx);
-//!     let mut linker = Linker::new(&engine);
-//!     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-//!
-//!     // Add wasi-tls types and turn on the feature in linker
-//!     let mut opts = LinkOptions::default();
-//!     opts.tls(true);
-//!     wasmtime_wasi_tls::add_to_linker(&mut linker, &mut opts, |h: &mut Ctx| {
-//!         WasiTls::new(&h.wasi_tls_ctx, &mut h.table)
-//!     })?;
-//!
-//!     // ... use `linker` to instantiate within `store` ...
-//!     Ok(())
-//! }
-//!
-//! ```
-//! [wasi-tls]: https://github.com/WebAssembly/wasi-tls
-//! [wasi:cli]: https://docs.rs/wasmtime-wasi/latest
-
-#![deny(missing_docs)]
-#![doc(test(attr(deny(warnings))))]
-#![doc(test(attr(allow(dead_code, unused_variables, unused_mut))))]
-
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::rustls::pki_types::CertificateDer;
 use wasmtime::component::{HasData, ResourceTable};
 
 pub mod bindings;
@@ -78,8 +7,7 @@ mod host;
 mod io;
 mod rustls;
 
-pub use bindings::types::LinkOptions;
-pub use host::{HostClientConnection, HostClientHandshake, HostFutureClientStreams};
+pub use host::{HostCertificate, HostClient, HostConnection, HostPrivateIdentity, HostServer};
 pub use rustls::RustlsProvider;
 
 /// Capture the state necessary for use in the `wasi-tls` API implementation.
@@ -98,10 +26,9 @@ impl<'a> WasiTls<'a> {
 /// Add the `wasi-tls` world's types to a [`wasmtime::component::Linker`].
 pub fn add_to_linker<T: Send + 'static>(
     l: &mut wasmtime::component::Linker<T>,
-    opts: &mut LinkOptions,
     f: fn(&mut T) -> WasiTls<'_>,
 ) -> anyhow::Result<()> {
-    bindings::types::add_to_linker::<_, HasWasiTls>(l, &opts, f)?;
+    bindings::types::add_to_linker::<_, HasWasiTls>(l, f)?;
     Ok(())
 }
 
@@ -112,7 +39,8 @@ impl HasData for HasWasiTls {
 
 /// Builder-style structure used to create a [`WasiTlsCtx`].
 pub struct WasiTlsCtxBuilder {
-    provider: Box<dyn TlsProvider>,
+    client_provider: Box<dyn TlsProvider>,
+    server_provider: Box<dyn TlsProvider>,
 }
 
 impl WasiTlsCtxBuilder {
@@ -122,49 +50,75 @@ impl WasiTlsCtxBuilder {
     }
 
     /// Configure the TLS provider to use for this context.
-    ///
-    /// By default, this is set to the [`RustlsProvider`].
-    pub fn provider(mut self, provider: Box<dyn TlsProvider>) -> Self {
-        self.provider = provider;
+    pub fn client_provider(mut self, client_provider: Box<dyn TlsProvider>) -> Self {
+        self.client_provider = client_provider;
+        self
+    }
+
+    pub fn server_provider(mut self, server_provider: Box<dyn TlsProvider>) -> Self {
+        self.server_provider = server_provider;
         self
     }
 
     /// Uses the configured context so far to construct the final [`WasiTlsCtx`].
     pub fn build(self) -> WasiTlsCtx {
         WasiTlsCtx {
-            provider: self.provider,
+            client_provider: self.client_provider,
+            server_provider: self.server_provider,
         }
     }
 }
+
 impl Default for WasiTlsCtxBuilder {
     fn default() -> Self {
         Self {
-            provider: Box::new(RustlsProvider::default()),
+            client_provider: Box::new(RustlsProvider::client()),
+            server_provider: Box::new(RustlsProvider::server()),
         }
     }
 }
 
 /// Wasi TLS context needed for internal `wasi-tls` state.
 pub struct WasiTlsCtx {
-    pub(crate) provider: Box<dyn TlsProvider>,
+    pub(crate) client_provider: Box<dyn TlsProvider>,
+    pub(crate) server_provider: Box<dyn TlsProvider>,
 }
 
 /// The data stream that carries the encrypted TLS data.
-/// Typically this is a TCP stream.
 pub trait TlsTransport: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized + 'static> TlsTransport for T {}
 
 /// A TLS connection.
 pub trait TlsStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
+/// Information about an established TLS connection
+pub struct TlsConnectionInfo {
+    /// The negotiated cipher suite (as a u16 value)
+    pub cipher_suite: u16,
+
+    /// The peer's certificate (if any)
+    pub peer_certificate: Option<CertificateDer<'static>>,
+
+    /// The negotiated ALPN protocol (if any)
+    pub negotiated_alpn: Option<Vec<u8>>,
+}
+
 /// A TLS implementation.
 pub trait TlsProvider: Send + Sync + 'static {
     /// Set up a client TLS connection using the provided `server_name` and `transport`.
+    /// Returns the TLS stream and connection information.
     fn connect(
         &self,
         server_name: String,
         transport: Box<dyn TlsTransport>,
-    ) -> BoxFuture<std::io::Result<Box<dyn TlsStream>>>;
+    ) -> BoxFuture<std::io::Result<(Box<dyn TlsStream>, TlsConnectionInfo)>>;
+
+    /// Accept a server TLS connection using the provided `transport`.
+    /// Returns the TLS stream and connection information.
+    fn accept(
+        &self,
+        transport: Box<dyn TlsTransport>,
+    ) -> BoxFuture<std::io::Result<(Box<dyn TlsStream>, TlsConnectionInfo)>>;
 }
 
-pub(crate) type BoxFuture<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
+pub(crate) type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;

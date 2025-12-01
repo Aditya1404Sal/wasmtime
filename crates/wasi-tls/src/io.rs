@@ -208,7 +208,7 @@ where
         AsyncWriteStream(Arc::new(Mutex::new(WriteState::new(io))))
     }
 
-    pub(crate) fn close(&mut self) -> wasmtime::Result<()> {
+    pub fn close(&mut self) -> StreamResult<()> {
         self.try_lock()?.close();
         Ok(())
     }

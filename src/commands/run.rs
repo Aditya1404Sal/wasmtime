@@ -1050,9 +1050,9 @@ impl RunCommand {
                         bail!("Cannot enable wasi-tls for core wasm modules");
                     }
                     CliLinker::Component(linker) => {
-                        let mut opts = wasmtime_wasi_tls::LinkOptions::default();
-                        opts.tls(true);
-                        wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h| {
+                        //let mut opts = wasmtime_wasi_tls::LinkOptions::default();
+                        //opts.tls(true);
+                        wasmtime_wasi_tls::add_to_linker(linker, |h| {
                             let ctx = h.wasip1_ctx.as_mut().expect("wasi is not configured");
                             let ctx = Arc::get_mut(ctx).unwrap().get_mut().unwrap();
                             WasiTls::new(
