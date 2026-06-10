@@ -53,7 +53,8 @@
 use crate::bail_bug;
 use crate::component::func::{self, Func, call_post_return};
 use crate::component::{
-    HasData, HasSelf, Instance, Resource, ResourceTable, ResourceTableError, RuntimeInstance,
+    HasData, HasSelf, Instance, InstancePre, Resource, ResourceTable, ResourceTableError,
+    RuntimeInstance,
 };
 use crate::fiber::{self, StoreFiber, StoreFiberYield};
 use crate::prelude::*;
@@ -461,6 +462,25 @@ where
                 get_data: self.get_data,
             })
         })
+    }
+
+    /// Instantiate a component within the current concurrent store.
+    pub async fn instantiate_async(&self, pre: &InstancePre<T>) -> Result<Instance>
+    where
+        T: Send + 'static,
+    {
+        let store = tls::get(|vmstore| {
+            let store = self.token.as_context_mut(vmstore);
+            // This mirrors the surrounding concurrent runtime's TLS model: the
+            // store pointer is made available for every poll of the host future
+            // by `poll_until`, and the future never outlives that event-loop
+            // invocation. `StoreContextMut` carries a borrow lifetime that Rust
+            // cannot express through TLS, so extend it to the future here.
+            unsafe {
+                std::mem::transmute::<StoreContextMut<'_, T>, StoreContextMut<'static, T>>(store)
+            }
+        });
+        pre.instantiate_async(store).await
     }
 
     /// Returns the getter this accessor is using to project from `T` into
