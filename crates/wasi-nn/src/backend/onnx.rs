@@ -406,27 +406,74 @@ impl TryFrom<TensorElementType> for TensorType {
     }
 }
 
+/// Decode little-endian bytes into a vector of a fixed-width numeric type.
+///
+/// The length check matters: `chunks_exact` silently drops a trailing partial
+/// element, which would quietly shorten the tensor and surface much later as a
+/// confusing shape mismatch deep inside ONNX Runtime.
+macro_rules! decode_le {
+    ($bytes:expr, $ty:ty) => {{
+        const WIDTH: usize = std::mem::size_of::<$ty>();
+        let bytes: &[u8] = $bytes;
+        if bytes.len() % WIDTH != 0 {
+            return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                "tensor data is {} bytes, not a multiple of {}",
+                bytes.len(),
+                WIDTH
+            )));
+        }
+        bytes
+            .chunks_exact(WIDTH)
+            .map(|chunk| {
+                let mut buf = [0u8; WIDTH];
+                buf.copy_from_slice(chunk);
+                <$ty>::from_le_bytes(buf)
+            })
+            .collect::<Vec<$ty>>()
+    }};
+}
+
 fn to_input_value(slot: &TensorSlot) -> Result<[SessionInputValue<'_>; 1], BackendError> {
     match &slot.tensor {
-        Some(tensor) => match tensor.ty {
-            TensorType::Fp32 => {
-                let data = bytes_to_f32_vec(tensor.data.to_vec());
-                let dimensions: Vec<i64> = tensor
-                    .dimensions
-                    .iter()
-                    .map(|d| *d as i64) // TODO: fewer conversions
-                    .collect();
-                let ort_tensor = OrtTensor::<f32>::from_array((dimensions, data)).map_err(|e| {
-                    BackendError::BackendAccess(wasmtime::format_err!(
-                        "failed to create ONNX session input: {e}"
-                    ))
-                })?;
-                Ok(inputs![ort_tensor])
+        Some(tensor) => {
+            let dimensions: Vec<i64> = tensor.dimensions.iter().map(|d| *d as i64).collect();
+
+            // Previously this handled only `Fp32` and `unimplemented!()`d the
+            // rest, which panics the host from inside a guest call rather than
+            // returning an error the guest can handle. That ruled out every
+            // transformer: BERT-family encoders take `input_ids`,
+            // `attention_mask` and `token_type_ids` as i64, so wasi-nn could not
+            // serve the most common class of model there is.
+            //
+            // Note the asymmetry it left behind: `to_tensor_type` already maps
+            // ONNX Int64 *outputs* to `TensorType::I64`, so the backend could
+            // hand back a type it refused to accept.
+            macro_rules! build {
+                ($ty:ty) => {{
+                    let data = decode_le!(tensor.data.as_slice(), $ty);
+                    let ort_tensor =
+                        OrtTensor::<$ty>::from_array((dimensions, data)).map_err(|e| {
+                            BackendError::BackendAccess(wasmtime::format_err!(
+                                "failed to create ONNX session input: {e}"
+                            ))
+                        })?;
+                    Ok(inputs![ort_tensor])
+                }};
             }
-            _ => {
-                unimplemented!("{:?} not supported by ONNX", tensor.ty);
+
+            match tensor.ty {
+                TensorType::Fp32 => build!(f32),
+                TensorType::Fp64 => build!(f64),
+                TensorType::I32 => build!(i32),
+                TensorType::I64 => build!(i64),
+                TensorType::U8 => build!(u8),
+                // An error rather than `unimplemented!()`: an unsupported model
+                // should be recoverable at the guest, not a host panic.
+                other => Err(BackendError::BackendAccess(wasmtime::format_err!(
+                    "{other:?} not supported by the ONNX backend"
+                ))),
             }
-        },
+        }
         None => {
             return Err(BackendError::BackendAccess(wasmtime::format_err!(
                 "missing input tensor: {}",
